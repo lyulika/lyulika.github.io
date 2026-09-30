@@ -1,6 +1,8 @@
 name: LIFE_OS external watchdog
 
 on:
+  schedule:
+    - cron: '17 * * * *'
   push:
     branches: [main]
     paths:
@@ -8,11 +10,99 @@ on:
 
 permissions:
   contents: read
+  issues: write
+
+concurrency:
+  group: lifeos-external-watchdog
+  cancel-in-progress: false
 
 jobs:
-  execution-probe:
+  outside-in:
     runs-on: ubuntu-latest
     timeout-minutes: 2
+    env:
+      TARGET_URL: https://hermes-pilot-vm.tail37c511.ts.net/
+      STATE_ISSUE: '1'
+      OWNER_LOGIN: lyulika
+      GH_TOKEN: ${{ github.token }}
     steps:
-      - name: Verify public hosted execution
-        run: echo "PUBLIC_HOSTED_EXECUTION=PASS"
+      - name: Probe, reduce state, notify on transition
+        shell: bash
+        run: |
+          set -euo pipefail
+          api="https://api.github.com/repos/${GITHUB_REPOSITORY}"
+          auth=(-H "Authorization: Bearer ${GH_TOKEN}" -H "Accept: application/vnd.github+json")
+
+          issue_json="$(curl -fsS "${auth[@]}" "$api/issues/${STATE_ISSUE}")"
+          body="$(python3 -c 'import json,sys; print(json.load(sys.stdin).get("body") or "")' <<<"$issue_json")"
+          stable="$(sed -n 's/^stable_state=//p' <<<"$body" | head -1)"
+          streak="$(sed -n 's/^negative_streak=//p' <<<"$body" | head -1)"
+          alerted="$(sed -n 's/^last_alerted_state=//p' <<<"$body" | head -1)"
+          changed_at="$(sed -n 's/^last_change_at=//p' <<<"$body" | head -1)"
+
+          stable="${stable:-UNKNOWN}"
+          streak="${streak:-0}"
+          alerted="${alerted:-NONE}"
+          changed_at="${changed_at:-UNKNOWN}"
+
+          code="$(curl -sS -o /dev/null -w '%{http_code}' --connect-timeout 5 --max-time 10 "$TARGET_URL" || true)"
+          if [[ "$code" =~ ^[1-4][0-9][0-9]$ ]]; then
+            observation="ONLINE"
+          elif [[ "$code" =~ ^5[0-9][0-9]$ ]]; then
+            observation="UNKNOWN"
+          else
+            observation="OFFLINE_EVIDENCE"
+          fi
+
+          now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          event=""
+          changed=false
+
+          case "$observation" in
+            ONLINE)
+              if [[ "$streak" != "0" ]]; then streak=0; changed=true; fi
+              if [[ "$stable" == "UNKNOWN" ]]; then
+                stable="ONLINE"; changed_at="$now"; changed=true
+              elif [[ "$stable" == "OFFLINE" ]]; then
+                stable="ONLINE"; changed_at="$now"; changed=true
+                if [[ "$alerted" != "ONLINE" ]]; then
+                  event="RECOVERY"; alerted="ONLINE"
+                fi
+              fi
+              ;;
+            UNKNOWN)
+              if [[ "$streak" != "0" ]]; then streak=0; changed=true; fi
+              ;;
+            OFFLINE_EVIDENCE)
+              if [[ "$stable" != "OFFLINE" ]]; then
+                streak=$((streak + 1)); changed=true
+                if (( streak >= 2 )); then
+                  stable="OFFLINE"; changed_at="$now"
+                  if [[ "$alerted" != "OFFLINE" ]]; then
+                    event="NEW_OUTAGE"; alerted="OFFLINE"
+                  fi
+                fi
+              fi
+              ;;
+          esac
+
+          echo "WATCHDOG_OBSERVATION=$observation"
+          echo "WATCHDOG_HTTP=$code"
+          echo "WATCHDOG_STABLE_STATE=$stable"
+          echo "WATCHDOG_EVENT=${event:-NONE}"
+
+          if [[ -n "$event" ]]; then
+            if [[ "$event" == "NEW_OUTAGE" ]]; then
+              msg="@${OWNER_LOGIN} LIFE_OS outside-in: endpoint unreachable after two consecutive checks at ${now}."
+            else
+              msg="@${OWNER_LOGIN} LIFE_OS outside-in: endpoint recovered at ${now}."
+            fi
+            payload="$(python3 -c 'import json,sys; print(json.dumps({"body":sys.stdin.read()}))' <<<"$msg")"
+            curl -fsS -X POST "${auth[@]}" -H "Content-Type: application/json"               "$api/issues/${STATE_ISSUE}/comments" -d "$payload" >/dev/null
+          fi
+
+          if [[ "$changed" == "true" ]]; then
+            new_body="$(printf 'stable_state=%s\nnegative_streak=%s\nlast_alerted_state=%s\nlast_change_at=%s\n\nManaged automatically by the external availability watchdog.\n'               "$stable" "$streak" "$alerted" "$changed_at")"
+            payload="$(python3 -c 'import json,sys; print(json.dumps({"body":sys.stdin.read()}))' <<<"$new_body")"
+            curl -fsS -X PATCH "${auth[@]}" -H "Content-Type: application/json"               "$api/issues/${STATE_ISSUE}" -d "$payload" >/dev/null
+          fi
