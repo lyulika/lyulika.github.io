@@ -1,0 +1,18 @@
+name: LIFE_OS external watchdog
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/lifeos-external-watchdog.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  execution-probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Verify public hosted execution
+        run: echo "PUBLIC_HOSTED_EXECUTION=PASS"
